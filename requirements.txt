@@ -1,0 +1,9 @@
+Flask
+Flask-Mail
+psycopg2-binary
+APScheduler
+requests
+python-dotenv
+flask-cors
+gunicorn
+Flask_Limiter
