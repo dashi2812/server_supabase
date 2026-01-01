@@ -77,9 +77,10 @@ def get_db():
 # ==============================
 # COMPANY CACHE
 # ==============================
+
 Company = namedtuple(
     "Company",
-    "id name email discord webhook_url webhook_secret plan expiry fields"
+    "id name email discord_webhook webhook_url webhook_secret plan expiry fields"
 )
 
 COMPANY_CACHE = {}
@@ -326,7 +327,7 @@ def submit():
     # DISCORD / ALL → notify
     if company.plan in ("discord", "all"):
         msg = f"📩 **New Lead**\n" + "\n".join(f"**{k}**: {v}" for k, v in lead.items())
-        send_discord(company.discord, msg)
+        send_discord(company.discord_webhook , msg)
 
     # WEBHOOK
     if company.plan in ("webhook", "all"):
@@ -357,3 +358,4 @@ if __name__ == "__main__":
     logger.info("Starting Flask app...")
     load_companies(force=True)
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+
