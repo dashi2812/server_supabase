@@ -64,11 +64,12 @@ limiter = Limiter(app=app, key_func=limiter_key)
 # ==============================
 def get_db():
     try:
-        return connect(
+        conn = connect(
             os.getenv("SUPABASE_DATABASE_URL"),
             sslmode="require",
             connect_timeout=5,
         )
+        return conn
     except OperationalError as e:
         logger.error("DB connection failed: %s", e)
         return None
@@ -92,6 +93,7 @@ def load_companies(force=False):
 
     conn = get_db()
     if not conn:
+        logger.warning("Cannot load companies, DB connection failed")
         return
 
     try:
@@ -107,6 +109,9 @@ def load_companies(force=False):
             for row in cur.fetchall():
                 COMPANY_CACHE[row[0]] = Company(*row[1:])
         LAST_LOAD = time.time()
+        logger.info("Loaded %d active companies", len(COMPANY_CACHE))
+    except Exception as e:
+        logger.error("Error loading companies: %s", e)
     finally:
         conn.close()
 
@@ -134,11 +139,15 @@ def add_daily_lead(company_id):
                 (company_id,)
             )
         conn.commit()
+        logger.info("Incremented daily leads for company_id=%s", company_id)
+    except Exception as e:
+        logger.error("Failed to increment daily leads: %s", e)
+        conn.rollback()
     finally:
         conn.close()
 
 # ==============================
-# SAVE LEAD (EMAIL / ALL ONLY)
+# SAVE LEAD
 # ==============================
 def save_lead(company_id, data):
     conn = get_db()
@@ -156,6 +165,7 @@ def save_lead(company_id, data):
             )
         conn.commit()
         add_daily_lead(company_id)
+        logger.info("Lead saved for company_id=%s", company_id)
         return True
     except Exception as e:
         logger.error("save_lead error: %s", e)
@@ -173,36 +183,49 @@ def send_email(to, csv_content, expiry):
     if 0 <= dleft < 3:
         body += f"\n\n⚠️ Plan expires in {dleft} day(s)."
 
-    with app.app_context():
-        msg = Message("Daily Lead Report", recipients=[to], body=body)
-        msg.attach("leads.csv", "text/csv", csv_content)
-        mail.send(msg)
+    try:
+        with app.app_context():
+            msg = Message("Daily Lead Report", recipients=[to], body=body)
+            msg.attach("leads.csv", "text/csv", csv_content)
+            mail.send(msg)
+        logger.info("Email sent to %s", to)
+    except Exception as e:
+        logger.error("Failed to send email to %s: %s", to, e)
 
 def send_discord(webhook, content):
-    if webhook:
+    if not webhook:
+        return
+    try:
         requests.post(webhook, json={"content": content}, timeout=5)
+        logger.info("Discord message sent")
+    except Exception as e:
+        logger.error("Discord send failed: %s", e)
 
 def send_webhook(url, secret, payload):
     if not url or not secret:
         return
-    body = json.dumps(payload)
-    timestamp = str(int(time.time()))
-    signature = hmac.new(
-        secret.encode(),
-        (timestamp + body).encode(),
-        hashlib.sha256
-    ).hexdigest()
+    try:
+        body = json.dumps(payload)
+        timestamp = str(int(time.time()))
+        signature = hmac.new(
+            secret.encode(),
+            (timestamp + body).encode(),
+            hashlib.sha256
+        ).hexdigest()
 
-    requests.post(
-        url,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "X-Signature": signature,
-            "X-Timestamp": timestamp,
-        },
-        timeout=5
-    )
+        requests.post(
+            url,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature": signature,
+                "X-Timestamp": timestamp,
+            },
+            timeout=5
+        )
+        logger.info("Webhook sent to %s", url)
+    except Exception as e:
+        logger.error("Webhook failed: %s", e)
 
 # ==============================
 # DAILY REPORT
@@ -210,6 +233,7 @@ def send_webhook(url, secret, payload):
 def daily_report():
     conn = get_db()
     if not conn:
+        logger.error("Cannot run report, DB connection failed")
         return
 
     try:
@@ -253,7 +277,11 @@ def daily_report():
                     WHERE company_id=%s AND created_at::date=CURRENT_DATE
                 """, (cid,))
 
-                conn.commit()
+            conn.commit()
+            logger.info("Daily report processed successfully")
+    except Exception as e:
+        logger.exception("Daily report failed")
+        conn.rollback()
     finally:
         conn.close()
 
@@ -264,18 +292,28 @@ def daily_report():
 @limiter.limit("5 per 10 minutes")
 def submit():
     sub = resolve_subdomain()
-    company = COMPANY_CACHE.get(sub)
+    logger.info("Incoming lead from subdomain: %s", sub)
 
+    company = COMPANY_CACHE.get(sub)
     if not company:
+        logger.info("Cache miss for subdomain %s, reloading...", sub)
         load_companies(force=True)
         company = COMPANY_CACHE.get(sub)
 
-    if not company or company.expiry < date.today():
+    if not company:
+        logger.warning("No active company found for subdomain %s", sub)
+        return jsonify(error="Unauthorized"), 403
+
+    if company.expiry < date.today():
+        logger.warning("Company plan expired for subdomain %s", sub)
         return jsonify(error="Unauthorized"), 403
 
     lead = {f: request.form.get(f) for f in company.fields if request.form.get(f)}
     if not lead:
+        logger.warning("No valid lead data submitted for subdomain %s", sub)
         return jsonify(error="No valid data"), 400
+
+    logger.info("Received lead for company %s: %s", company.name, lead)
 
     # EMAIL / ALL → store
     if company.plan in ("email", "all"):
@@ -301,8 +339,21 @@ def submit():
 
 @app.route("/report")
 def report():
-    daily_report()
-    return {"status": "ok"}
+    logger.info("Report triggered")
+    start_time = time.time()
+    try:
+        daily_report()
+        elapsed = time.time() - start_time
+        logger.info("Report completed in %.2f seconds", elapsed)
+        return {"status": "ok"}
+    except Exception as e:
+        logger.exception("Daily report failed")
+        return {"error": "failed"}, 500
 
-
-
+# ==============================
+# RUN
+# ==============================
+if __name__ == "__main__":
+    logger.info("Starting Flask app...")
+    load_companies(force=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
